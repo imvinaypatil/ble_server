@@ -17,10 +17,9 @@
 #include <signal.h>
 //#include "whitelist.h"
 #define PORT 4040
-#define LISTEN_QUEUE_LIMIT 6
+#define LISTEN_QUEUE_LIMIT 0
 #define TOTAL_CLIENTS 10
 #define TIMEOUT 1000
-#define TOTAL_CLIENTS 10
 /* Global variables */
 extern int errno;
 const char *READER_ID = "00:03";
@@ -31,6 +30,7 @@ extern int errno;
 int totalwladdr =0;
 static int wlstatus = 0;
 /* Global functions */
+
 struct hci_request ble_hci_request(uint16_t ocf, int clen, void * status, void * cparam)
 {
 	struct hci_request rq;
@@ -44,6 +44,12 @@ struct hci_request ble_hci_request(uint16_t ocf, int clen, void * status, void *
 	return rq;
 }
 
+static void sighandler(int sig, siginfo_t *siginfo, void *context){
+	printf ("Sending PID: %ld, UID: %ld\n",(long)siginfo->si_pid, (long)siginfo->si_uid);
+	printf("DEVICE closed : %d\n",device );
+	hci_close_dev(device);
+	//close(sock);
+}
 /****************** PRSCAN *********************/
 int prescan(){
   device = hci_open_dev(hci_get_route(NULL));
@@ -59,7 +65,6 @@ void whitelist_clr(){
   int err;
 	//int dd;
   prescan();
-	printf("HCI device id for wlclr = %d \n",device );
   err = hci_le_clear_white_list(device, TIMEOUT);
   if (err < 0) {
 		err = -errno;
@@ -81,8 +86,6 @@ int configure_whitelist(){
   int tag_count = 0,dd;
 	whitelist_clr();
   prescan();
-	perror("After hci open wlconf");
-	printf("HCI device id for wlconf = %d \n",device );
   if ((fp = fopen("whitelist.conf","r")) == NULL) {
     perror ("\n Failed to open file");
     return -1;
@@ -121,13 +124,16 @@ int configure_whitelist(){
 
 
 /*********************** BLE SCAN THREAD HANDLER ********************/
-void *scan_le(void *socket_desc)
+static void *scan_le(void *client_sock)
 {
   int ret, status;
   //Get the socket descriptor
-  int sock = *(int*)socket_desc;
-  void *reads = NULL;
-	puts("Thread started");
+  int sock = (int )client_sock;
+	//free(client_sock);
+  //void *reads = NULL;
+	int tid = pthread_self();
+	pthread_detach(tid);
+	printf("Thread %d connected to socket %d\n",tid,sock );
   prescan();
 	// Set BLE scan parameters.
   le_set_scan_parameters_cp scan_params_cp;
@@ -148,7 +154,7 @@ void *scan_le(void *socket_desc)
 	if ( ret < 0 ) {
 		hci_close_dev(device);
 		perror("Failed to set scan parameters data.");
-		return 0;
+		return (NULL);
 	}
 
 	// Set BLE events report mask.
@@ -164,7 +170,7 @@ void *scan_le(void *socket_desc)
 		printf("DEVICE closed : %d\n",device );
 		hci_close_dev(device);
 		perror("Failed to set event mask.");
-		return 0;
+		return (NULL);
 	}
 
 	scan_cp.enable 		= 0x01;	// Enable flag.
@@ -177,7 +183,7 @@ void *scan_le(void *socket_desc)
 		printf("DEVICE closed : %d\n",device );
 		hci_close_dev(device);
 		perror("Failed to enable scan.");
-		return 0;
+		return (NULL);
 	}
 
 	// Get Results.
@@ -189,7 +195,7 @@ void *scan_le(void *socket_desc)
 	if ( setsockopt(device, SOL_HCI, HCI_FILTER, &nf, sizeof(nf)) < 0 ) {
 		hci_close_dev(device);
 		perror("Could not set socket options\n");
-		return 0;
+		return (NULL);
 	}
 
 
@@ -232,35 +238,36 @@ void *scan_le(void *socket_desc)
 					sprintf(buffer + strlen(buffer),"%d,",motion_status);
 					sprintf(buffer + strlen(buffer),"%d#",rssi);
 					printf("%s \n",buffer);
-				 // signal(SIGPIPE, SIG_IGN);
-					loopcontrol = write(sock , buffer , sizeof(buffer));
-					/*
-					if ((loopcontrol = write(sock , buffer , sizeof(buffer))) <= 0 ){
+				 //signal(SIGPIPE, SIG_IGN);
+				 //if (errno==EPIPE)
+					// break;
+				//	loopcontrol = write(sock , buffer , sizeof(buffer));
+
+					if ((loopcontrol = write(sock , buffer , sizeof(buffer))) <= 0 )
 						printf("Failed to write!\n" );
-						if (errno == EPIPE)
-							perror("\n socket disconnected\n");
-						break ;
+					if (errno == EPIPE){
+							perror("\nsocket disconnected");
+							break ;
 					}
-					*/
-          offset = info->data + info->length + 2;
-          //  if (loopcontrol == -1 )
-          //    break ;
-			  }
-		  }
-    }
-		if (errno==EPIPE)
-			break;
-  }
+					offset = info->data + info->length + 2;
+				}
+			}
+		}
+		if (errno==EPIPE){
+				//close(sock);
+				break;
+		 }
+	}
+
   /**************************************/
   // Disable scanning.
 
     memset(&scan_cp, 0, sizeof(scan_cp));
-    scan_cp.enable = 0xd8;	// Disable flag.
+    scan_cp.enable = 0x00;	// Disable flag.
 
     struct hci_request disable_adv_rq = ble_hci_request(OCF_LE_SET_SCAN_ENABLE, LE_SET_SCAN_ENABLE_CP_SIZE, &status, &scan_cp);
     ret = hci_send_req(device, &disable_adv_rq, TIMEOUT);
     if ( ret < 0 ) {
-			printf("DEVICE closed : %d\n",device );
       hci_close_dev(device);
       perror("Failed to disable scan.");
 
@@ -268,26 +275,14 @@ void *scan_le(void *socket_desc)
     if(loopcontrol <= 0){
             puts("Client disconnected");
             fflush(stdout);
+						hci_close_dev(device);
+						close(sock);
 						printf("DEVICE closed : %d\n",device );
-            hci_close_dev(device);
-            close(sock);
-            return 0;
-    }
-    else {
-			printf("DEVICE closed : %d\n",device );
-      hci_close_dev(device);
-      close(sock);
+						pthread_exit( NULL );
+            return (NULL);
     }
     printf("BREAKPOINT 1\n" );
-    /*
-    loopcontrol = 1;
-    if ((loopcontrol = read(sock,reads,1)) != -1)
-      continue;
-    else
-      break;
-      */
-  //}
-  return 0;
+  	return (NULL);
 }
 
 /*
@@ -300,12 +295,31 @@ int main(int argc , char *argv[])
 		int status;
 		char ret = '\0';
 		int temp;
-    int    option_value;
-    struct sockaddr_in server , client;
+    int option_value;
+    struct sockaddr_in server,client;
     pthread_t thread_id[TOTAL_CLIENTS];
+		pthread_t aclhdl_thread;
+		struct sigaction act;
+		sigset_t sig_set;
+		sigset_t saved_set;
+		sigemptyset(&sig_set);
+		sigaddset(&sig_set,SIGPIPE);
+		//sigaddset(&sig_set,SIGQUIT);
+		if (pthread_sigmask(SIG_BLOCK, &sig_set, &saved_set) == -1) {
+  		perror("set pthread_sigmask failed");
+  		exit(1);
+		}
+
+		memset (&act, '\0', sizeof(act));
     memset((pthread_t *)thread_id,0,sizeof(thread_id));
     memset((char *)&server, 0, sizeof(server));
     memset((char *)&client, 0, sizeof(client));
+		act.sa_sigaction = &sighandler;
+		act.sa_flags = SA_SIGINFO;
+		if (sigaction(SIGPIPE | SIGTERM | SIGQUIT, &act, NULL) < 0) {
+		perror ("couldn't set sigaction");
+		return 1;
+	  }
 //  if (device <= 0)
   		prescan();
     if ( argc > 1){
@@ -366,12 +380,12 @@ int main(int argc , char *argv[])
         puts("Connection accepted");
         printf("\n Connected to (%s : %d)\n",inet_ntoa(client.sin_addr),ntohs(client.sin_port));
       //  prescan();
-        if( pthread_create( &thread_id[current_client] , NULL , (void *) scan_le , (void*) &client_sock) != 0)
+        if( pthread_create( &thread_id[current_client] , NULL ,(void *) &scan_le , (void *)client_sock) != 0)
         {
             perror("could not create thread");
             return 1;
         }
-        connected_clients[current_client]=client_sock;
+        connected_clients[current_client] = client_sock;
         current_client++; /*Incrementing Client number*/
         //Now join the thread , so that we dont terminate before the thread
         pthread_join( thread_id[current_client] , NULL);
@@ -383,6 +397,7 @@ int main(int argc , char *argv[])
         perror("accept failed");
         return 1;
     }
+		close(socket_desc);
     if (device > 0)
 			printf("DEVICE closed : %d\n",device );
   		hci_close_dev(device);
